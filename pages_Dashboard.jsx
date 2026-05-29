@@ -1,21 +1,26 @@
 /**
  * ============================================================
- * AP3X -- Therapy Session & Care Coordination Dashboard
- * Main clinician overview with session timeline, patient cards,
- * activity feed, and AI insight panel.
+ * AP3X -- Therapist Dashboard
+ * Real-time overview: patient risk alerts, recent check-ins,
+ * active sessions, AI risk signals, and quick-access actions.
  * ============================================================
  */
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import Icon from './components_ui_Icon'
-import { useSessionStore, usePatientStore, useSimulationStore, useAppStore } from './core_storage'
-import sessionSimulation, { PATIENT_STATE_CONFIG, SESSION_PHASES, SESSION_EVENTS } from './engine_sessionSimulation'
+import { usePatientStore, useSessionStore, useCheckinStore, useAppStore } from './core_storage'
+import { patientSync }  from './services_sync_patientSync'
+import { riskEngine, RISK_LEVELS, RISK_CONFIG, SIGNAL_TYPES } from './engine_riskEngine'
+import sessionSimulation, { PATIENT_STATE_CONFIG } from './engine_sessionSimulation'
 
 // ─── Live Clock ───────────────────────────────────────────────
 function LiveClock() {
   const [time, setTime] = useState(new Date())
-  useEffect(() => { const id = setInterval(() => setTime(new Date()), 1000); return () => clearInterval(id) }, [])
+  useEffect(() => {
+    const id = setInterval(() => setTime(new Date()), 1000)
+    return () => clearInterval(id)
+  }, [])
   return (
     <div className="text-right">
       <div className="font-mono text-2xl font-bold text-white tabular-nums tracking-tight">
@@ -28,14 +33,15 @@ function LiveClock() {
   )
 }
 
-// ─── KPI Card ─────────────────────────────────────────────────
-function KpiCard({ label, value, sub, icon, color, bg, border, onClick }) {
+// ─── KPI card ─────────────────────────────────────────────────
+function KpiCard({ label, value, sub, icon, color, bg, border, onClick, pulse }) {
   return (
     <div onClick={onClick} className={`${bg} border ${border} rounded-xl p-4 cursor-pointer hover:brightness-110 transition-all group`}>
       <div className="flex items-center justify-between mb-3">
         <span className="text-2xs text-slate-500 font-semibold tracking-widest uppercase">{label}</span>
-        <div className={`w-8 h-8 rounded-lg ${bg} border ${border} flex items-center justify-center`}>
+        <div className={`w-8 h-8 rounded-lg ${bg} border ${border} flex items-center justify-center relative`}>
           <Icon name={icon} size={14} className={color} />
+          {pulse && <span className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-red-400 rounded-full animate-pulse" />}
         </div>
       </div>
       <div className={`font-mono text-3xl font-bold ${color} tabular-nums`}>{value ?? '--'}</div>
@@ -44,142 +50,87 @@ function KpiCard({ label, value, sub, icon, color, bg, border, onClick }) {
   )
 }
 
-// ─── Patient Activity Card ────────────────────────────────────
-function PatientCard({ patient, onClick }) {
-  const cfg = PATIENT_STATE_CONFIG[patient.state] || PATIENT_STATE_CONFIG.neutral
+// ─── Risk badge ───────────────────────────────────────────────
+function RiskBadge({ level }) {
+  const cfg = RISK_CONFIG[level] || RISK_CONFIG.none
   return (
-    <div onClick={onClick} className="flex items-center gap-3 px-3 py-3 rounded-xl bg-slate-800/30 border border-slate-800/60 hover:bg-slate-800/50 cursor-pointer transition-all group">
-      <div className="w-9 h-9 rounded-full bg-teal-500/10 border border-teal-500/20 flex items-center justify-center flex-shrink-0">
-        <span className="text-xs font-bold text-teal-400">{patient.initials}</span>
+    <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-2xs font-medium border ${cfg.bg} ${cfg.border} ${cfg.color}`}>
+      <Icon name={cfg.icon} size={9} />
+      {cfg.label}
+      {cfg.pulse && <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse ml-0.5" />}
+    </span>
+  )
+}
+
+// ─── Risk alert card ──────────────────────────────────────────
+function RiskAlertCard({ assessment, onView, onDismiss }) {
+  const cfg     = RISK_CONFIG[assessment.level]
+  const topSig  = assessment.signals[0]
+
+  return (
+    <div className={`flex items-start gap-3 p-3 rounded-xl border ${cfg.bg} ${cfg.border} group`}>
+      <div className={`w-9 h-9 rounded-full bg-slate-900/40 border ${cfg.border} flex items-center justify-center flex-shrink-0`}>
+        <Icon name={cfg.icon} size={16} className={`${cfg.color} ${cfg.pulse ? 'animate-pulse' : ''}`} />
       </div>
       <div className="flex-1 min-w-0">
-        <div className="text-sm font-semibold text-white group-hover:text-teal-200 transition-colors truncate">{patient.name}</div>
-        <div className="text-2xs text-slate-500">Last session: {patient.lastSession}</div>
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-sm font-semibold text-white">{assessment.patientName}</span>
+          <RiskBadge level={assessment.level} />
+        </div>
+        {topSig && (
+          <p className="text-xs text-slate-400 mt-0.5 leading-relaxed line-clamp-2">{topSig.message}</p>
+        )}
+        <div className="text-2xs text-slate-600 mt-1">
+          {assessment.signals.length} signal{assessment.signals.length !== 1 ? 's' : ''} detected
+        </div>
       </div>
-      <div className={`flex items-center gap-1.5 px-2 py-0.5 rounded-full text-2xs font-medium ${cfg.bg} ${cfg.border} border ${cfg.color}`}>
-        <Icon name={cfg.icon} size={10} />
-        {cfg.label}
+      <div className="flex flex-col gap-1 flex-shrink-0">
+        <button onClick={() => onView(assessment.patientId)}
+          className="text-2xs bg-slate-800/60 border border-slate-700/60 text-slate-300 px-2 py-1 rounded-md hover:text-white transition-colors">
+          View
+        </button>
+        <button onClick={() => onDismiss(assessment.patientId)}
+          className="text-2xs text-slate-600 hover:text-slate-400 transition-colors px-1">
+          Dismiss
+        </button>
       </div>
     </div>
   )
 }
 
-// ─── Session Timeline Row ─────────────────────────────────────
-function SessionTimelineRow({ session }) {
-  const isComplete = session.phase === SESSION_PHASES.COMPLETE
-  const cfg = PATIENT_STATE_CONFIG[session.state] || PATIENT_STATE_CONFIG.neutral
+// ─── Recent check-in row ──────────────────────────────────────
+function CheckinRow({ checkin }) {
+  const score = checkin.moodScore
+  const color = score >= 7 ? 'text-teal-400' : score >= 5 ? 'text-amber-400' : 'text-red-400'
   return (
-    <div className="flex items-start gap-3 px-3 py-3 rounded-lg hover:bg-slate-800/30 transition-colors">
-      <div className={`w-2 h-2 rounded-full mt-1.5 flex-shrink-0 ${isComplete ? 'bg-teal-400' : 'bg-amber-400 animate-pulse'}`} />
+    <div className="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-800/30 transition-colors">
+      <div className="w-8 h-8 rounded-full bg-slate-800/60 border border-slate-700/40 flex items-center justify-center flex-shrink-0">
+        <span className="text-xs font-bold text-slate-300">
+          {checkin.patientName?.split(' ').map(w=>w[0]).join('').slice(0,2) || '??'}
+        </span>
+      </div>
       <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2">
-          <span className="text-sm font-medium text-white truncate">{session.patientName}</span>
-          <span className={`text-2xs px-1.5 py-0.5 rounded-full ${cfg.bg} ${cfg.color} border ${cfg.border}`}>{cfg.label}</span>
-        </div>
-        <div className="text-2xs text-slate-500 mt-0.5">
-          {session.phase === SESSION_PHASES.COMPLETE ? 'Session complete' : `In progress -- ${session.phase?.replace('_', ' ')}`}
-          {' · '}{new Date(session.startedAt).toLocaleTimeString('en-GB', { hour12: false, hour: '2-digit', minute: '2-digit' })}
-        </div>
+        <div className="text-sm font-medium text-white truncate">{checkin.patientName || 'Unknown'}</div>
+        <div className="text-2xs text-slate-500 capitalize">{checkin.mood} · {new Date(checkin.ts).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}</div>
       </div>
-      {session.moodScore && (
-        <div className="text-right flex-shrink-0">
-          <div className="text-xs font-mono text-teal-400">{session.moodScore}/10</div>
-          <div className="text-2xs text-slate-600">mood</div>
-        </div>
-      )}
-    </div>
-  )
-}
-
-// ─── AI Insight Panel ─────────────────────────────────────────
-function AIInsightPanel({ sessions, patients }) {
-  const stateCounts = {}
-  patients.forEach(p => { stateCounts[p.state] = (stateCounts[p.state] || 0) + 1 })
-  const dominantState = Object.entries(stateCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || 'neutral'
-  const cfg = PATIENT_STATE_CONFIG[dominantState] || PATIENT_STATE_CONFIG.neutral
-
-  const completedToday = sessions.filter(s => {
-    const today = new Date().toDateString()
-    return s.phase === SESSION_PHASES.COMPLETE && new Date(s.startedAt).toDateString() === today
-  }).length
-
-  const avgMood = sessions.filter(s => s.moodScore).reduce((sum, s, _, arr) => sum + s.moodScore / arr.length, 0)
-
-  return (
-    <div className="bg-slate-800/20 border border-slate-800/60 rounded-xl p-4">
-      <div className="flex items-center gap-2 mb-4">
-        <div className="w-7 h-7 bg-violet-500/10 border border-violet-500/20 rounded-lg flex items-center justify-center">
-          <Icon name="Sparkles" size={13} className="text-violet-400" />
-        </div>
-        <span className="text-sm font-semibold text-white">Support Assistant Insights</span>
-        <span className="ml-auto text-2xs text-slate-600 italic">Simulation data</span>
-      </div>
-      <div className="space-y-3">
-        <div className="flex items-center justify-between py-2 border-b border-slate-800/40">
-          <span className="text-xs text-slate-400">Dominant patient state today</span>
-          <span className={`text-xs font-medium ${cfg.color}`}>{cfg.label}</span>
-        </div>
-        <div className="flex items-center justify-between py-2 border-b border-slate-800/40">
-          <span className="text-xs text-slate-400">Sessions completed today</span>
-          <span className="text-xs font-mono text-teal-400">{completedToday}</span>
-        </div>
-        <div className="flex items-center justify-between py-2 border-b border-slate-800/40">
-          <span className="text-xs text-slate-400">Avg mood score (all sessions)</span>
-          <span className="text-xs font-mono text-teal-400">{avgMood > 0 ? avgMood.toFixed(1) : '--'}/10</span>
-        </div>
-        <div className="pt-1">
-          <p className="text-2xs text-slate-500 leading-relaxed">
-            <Icon name="Info" size={10} className="inline mr-1 text-slate-600" />
-            This is a reflection support simulation. Data shown is for session tracking purposes only -- not clinical assessment.
-          </p>
-        </div>
+      <div className="flex items-center gap-1.5">
+        <span className={`font-mono font-bold text-sm ${color}`}>{checkin.moodScore}/10</span>
       </div>
     </div>
   )
 }
 
-// ─── Simulation Event Feed ────────────────────────────────────
-function EventFeed({ events }) {
-  if (events.length === 0) return (
-    <div className="flex flex-col items-center py-8 text-slate-700 gap-2">
-      <Icon name="Activity" size={24} className="opacity-20" />
-      <span className="text-xs">No session events yet -- start a simulation to see events</span>
-    </div>
-  )
+// ─── Active session row ───────────────────────────────────────
+function ActiveSessionRow({ session }) {
+  const elapsed = Math.round((Date.now() - new Date(session.startedAt).getTime()) / 60000)
   return (
-    <div className="space-y-1">
-      {events.slice(0, 10).map(e => (
-        <div key={e.id} className="flex items-start gap-2.5 px-2 py-2 rounded-lg hover:bg-slate-800/30 transition-colors">
-          <div className="w-6 h-6 rounded-md bg-slate-900 border border-slate-800/60 flex items-center justify-center flex-shrink-0 mt-0.5">
-            <Icon name="Activity" size={11} className="text-teal-400" />
-          </div>
-          <div className="flex-1 min-w-0">
-            <div className="text-xs text-slate-300 truncate capitalize">{e.label || e.type?.replace(/_/g, ' ')}</div>
-            {e.sessionId && <div className="text-2xs text-slate-600 truncate">Session {e.sessionId.slice(-6)}</div>}
-          </div>
-          <span className="text-2xs text-slate-700 font-mono flex-shrink-0">
-            {new Date(e.ts).toLocaleTimeString('en-GB', { hour12: false, hour: '2-digit', minute: '2-digit' })}
-          </span>
-        </div>
-      ))}
-    </div>
-  )
-}
-
-// ─── Demo Seed Button ─────────────────────────────────────────
-function DemoSeedBanner({ onSeed }) {
-  return (
-    <div className="bg-teal-500/5 border border-teal-500/20 rounded-xl p-4 flex items-center gap-4">
-      <div className="w-10 h-10 bg-teal-500/10 border border-teal-500/20 rounded-xl flex items-center justify-center flex-shrink-0">
-        <Icon name="Sparkles" size={18} className="text-teal-400" />
+    <div className="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-teal-500/5 border border-teal-500/10">
+      <div className="w-2 h-2 rounded-full bg-teal-400 animate-pulse flex-shrink-0" />
+      <div className="flex-1 min-w-0">
+        <div className="text-sm font-medium text-white">{session.patientName}</div>
+        <div className="text-2xs text-teal-400/60">Session in progress · {elapsed} min</div>
       </div>
-      <div className="flex-1">
-        <div className="text-sm font-semibold text-white">No simulation data yet</div>
-        <div className="text-xs text-slate-400 mt-0.5">Seed demo patients & sessions to explore the dashboard</div>
-      </div>
-      <button onClick={onSeed} className="flex-shrink-0 bg-teal-500/10 hover:bg-teal-500/20 border border-teal-500/30 text-teal-300 text-xs font-medium px-4 py-2 rounded-lg transition-colors">
-        Load Demo Data
-      </button>
+      <span className="text-2xs bg-teal-500/10 border border-teal-500/20 text-teal-400 px-2 py-0.5 rounded-full">Live</span>
     </div>
   )
 }
@@ -187,101 +138,245 @@ function DemoSeedBanner({ onSeed }) {
 // ─── Main Dashboard ───────────────────────────────────────────
 export default function Dashboard() {
   const navigate = useNavigate()
-  const { sessions } = useSessionStore()
-  const { patients, setPatients } = usePatientStore()
-  const { events } = useSimulationStore()
-  const { addSession } = useSessionStore()
+  const { patients, setPatients }     = usePatientStore()
+  const { sessions, setSessions }     = useSessionStore()
+  const { checkins, addCheckin }      = useCheckinStore()
+  const { addAlert }                  = useAppStore()
 
-  const hasData = patients.length > 0 || sessions.length > 0
+  const [riskAssessments, setRiskAssessments] = useState([])
+  const [dismissedIds, setDismissedIds]        = useState(() => {
+    try { return JSON.parse(localStorage.getItem('ap3x:dismissed_risks') || '[]') } catch { return [] }
+  })
+  const [liveCheckins, setLiveCheckins] = useState([])
+  const [activeSessions, setActiveSessions] = useState([])
 
-  const seedDemo = () => {
-    const demoPatients = sessionSimulation.getDemoPatients()
-    setPatients(demoPatients)
-    demoPatients.forEach(p => {
-      const history = sessionSimulation.generateDemoSessionHistory(p.id, p.name, 3)
-      history.forEach(s => addSession(s))
+  // ── Load + run risk analysis ───────────────────────────────
+  const runAnalysis = useCallback(() => {
+    const allCheckins    = patientSync.getAllCheckins()
+    const allReflections = patientSync.getAllReflections()
+    const allSessions    = patientSync.getAllSessions()
+    const allPatients    = patients.length > 0 ? patients : patientSync.getAllPatients()
+
+    // Merge stored sessions with sync sessions
+    const mergedSessions = [...allSessions, ...sessions].filter((s, i, arr) =>
+      arr.findIndex(x => x.id === s.id) === i
+    )
+
+    // Merge check-ins
+    const mergedCheckins = [...allCheckins, ...checkins].filter((c, i, arr) =>
+      arr.findIndex(x => x.id === c.id) === i
+    ).sort((a, b) => new Date(b.ts) - new Date(a.ts))
+
+    setLiveCheckins(mergedCheckins.slice(0, 10))
+
+    const active = mergedSessions.filter(s => s.phase !== 'complete' && s.startedAt &&
+      Date.now() - new Date(s.startedAt).getTime() < 2 * 60 * 60 * 1000
+    )
+    setActiveSessions(active)
+
+    if (allPatients.length > 0) {
+      const results = riskEngine.analyseAll(allPatients, mergedSessions, mergedCheckins, allReflections)
+      setRiskAssessments(results.filter(r => r.level !== RISK_LEVELS.NONE && !dismissedIds.includes(r.patientId)))
+    }
+  }, [patients, sessions, checkins, dismissedIds])
+
+  // ── Seed demo data if no patients ─────────────────────────
+  useEffect(() => {
+    if (patients.length === 0) {
+      const demoPts = sessionSimulation.getDemoPatients()
+      setPatients(demoPts)
+      const result = patientSync.seedDemoData(demoPts)
+      const demoPtHistory = demoPts.flatMap(p => sessionSimulation.generateDemoSessionHistory(p.id, p.name, 5))
+      setSessions(demoPtHistory)
+    }
+  }, [])
+
+  useEffect(() => { runAnalysis() }, [runAnalysis])
+
+  // ── Live sync via BroadcastChannel ────────────────────────
+  useEffect(() => {
+    const unsub = patientSync.onUpdate((msg) => {
+      if (['checkin', 'reflection', 'session', 'demo_seeded'].includes(msg.type)) {
+        runAnalysis()
+        if (msg.type === 'checkin') {
+          addAlert({ title: 'New Check-in', message: `${msg.payload.patientName} submitted a check-in (mood: ${msg.payload.mood})`, type: 'info' })
+        }
+      }
     })
+    return unsub
+  }, [runAnalysis])
+
+  // ── Poll every 30s as fallback ─────────────────────────────
+  useEffect(() => {
+    const id = setInterval(runAnalysis, 30000)
+    return () => clearInterval(id)
+  }, [runAnalysis])
+
+  const dismissRisk = (patientId) => {
+    const next = [...dismissedIds, patientId]
+    setDismissedIds(next)
+    localStorage.setItem('ap3x:dismissed_risks', JSON.stringify(next))
+    setRiskAssessments(prev => prev.filter(r => r.patientId !== patientId))
   }
 
-  const activeSessions  = sessions.filter(s => s.phase !== SESSION_PHASES.COMPLETE)
-  const completedToday  = sessions.filter(s => {
-    const today = new Date().toDateString()
-    return s.phase === SESSION_PHASES.COMPLETE && new Date(s.startedAt).toDateString() === today
-  }).length
-  const avgMood = sessions.filter(s => s.moodScore).reduce((sum, s, _, arr) => sum + s.moodScore / arr.length, 0)
+  // ── Stats ──────────────────────────────────────────────────
+  const allCheckins    = patientSync.getAllCheckins()
+  const todayCheckins  = allCheckins.filter(c => new Date(c.ts).toDateString() === new Date().toDateString())
+  const highRisk       = riskAssessments.filter(r => r.level === RISK_LEVELS.HIGH || r.level === RISK_LEVELS.CRITICAL)
+  const allSessions    = [...patientSync.getAllSessions(), ...sessions].filter((s,i,arr)=>arr.findIndex(x=>x.id===s.id)===i)
 
   return (
-    <div className="flex flex-col h-full overflow-y-auto">
+    <div className="p-5 space-y-5 max-w-5xl mx-auto">
+
       {/* Header */}
-      <div className="flex-shrink-0 px-6 py-4 border-b border-slate-800/60">
-        <div className="flex items-center justify-between">
-          <div>
-            <h1 className="text-lg font-bold text-white">AP3X Therapy Session & Care Coordination Dashboard</h1>
-            <p className="text-xs text-slate-500 mt-0.5">Clinician overview · Session simulation &amp; wellbeing reflection system</p>
-          </div>
-          <LiveClock />
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-xl font-bold text-white">Clinician Dashboard</h1>
+          <p className="text-slate-500 text-xs mt-0.5">
+            {patients.length} patients · AI risk monitoring active
+          </p>
         </div>
+        <LiveClock />
       </div>
 
-      <div className="flex-1 p-6 space-y-6 min-h-0">
-        {/* Demo seed */}
-        {!hasData && <DemoSeedBanner onSeed={seedDemo} />}
+      {/* Critical alerts (top priority) */}
+      {riskAssessments.filter(r => r.level === RISK_LEVELS.CRITICAL).length > 0 && (
+        <div className="bg-red-500/5 border border-red-500/30 rounded-xl p-4 space-y-3">
+          <div className="flex items-center gap-2">
+            <Icon name="ShieldAlert" size={16} className="text-red-400 animate-pulse" />
+            <span className="text-sm font-bold text-red-300">CRITICAL ALERTS — Immediate Review Required</span>
+          </div>
+          {riskAssessments.filter(r => r.level === RISK_LEVELS.CRITICAL).map(a => (
+            <RiskAlertCard key={a.patientId} assessment={a}
+              onView={id => navigate(`/patients/${id}`)}
+              onDismiss={dismissRisk} />
+          ))}
+        </div>
+      )}
 
-        {/* KPI Row */}
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-          <KpiCard label="Total Patients"     value={patients.length}    sub="in system"           icon="Users"        color="text-teal-400"    bg="bg-teal-500/5"    border="border-teal-500/15"    onClick={() => navigate('/patients')} />
-          <KpiCard label="Active Sessions"    value={activeSessions.length} sub="in progress"       icon="CalendarCheck" color="text-violet-400"  bg="bg-violet-500/5"  border="border-violet-500/15" onClick={() => navigate('/sessions')} />
-          <KpiCard label="Completed Today"    value={completedToday}     sub="sessions finished"   icon="CheckCircle"  color="text-emerald-400" bg="bg-emerald-500/5" border="border-emerald-500/15" onClick={() => navigate('/sessions')} />
-          <KpiCard label="Avg Mood Score"     value={avgMood > 0 ? avgMood.toFixed(1) : '--'} sub="across all sessions" icon="Heart" color="text-pink-400" bg="bg-pink-500/5" border="border-pink-500/15" onClick={() => navigate('/wellbeing')} />
+      {/* KPI row */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+        <KpiCard label="Patients"       value={patients.length}      icon="Users"        color="text-teal-400"    bg="bg-teal-500/5"    border="border-teal-500/15"    sub="Under care"            onClick={() => navigate('/patients')} />
+        <KpiCard label="Check-ins Today" value={todayCheckins.length} icon="Heart"        color="text-violet-400" bg="bg-violet-500/5"  border="border-violet-500/15"  sub="Submissions today"    onClick={() => navigate('/wellbeing')} />
+        <KpiCard label="Risk Flags"     value={riskAssessments.length} icon="AlertTriangle" color="text-amber-400" bg="bg-amber-500/5"  border="border-amber-500/15"   sub={`${highRisk.length} high/critical`} pulse={highRisk.length > 0} onClick={() => navigate('/patients')} />
+        <KpiCard label="Sessions Total" value={allSessions.length}   icon="CalendarCheck" color="text-emerald-400" bg="bg-emerald-500/5" border="border-emerald-500/15" sub="All time"             onClick={() => navigate('/sessions')} />
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+
+        {/* Risk Panel */}
+        <div className="bg-slate-800/20 border border-slate-800/60 rounded-xl overflow-hidden">
+          <div className="px-4 py-3 border-b border-slate-800/40 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Icon name="Brain" size={14} className="text-amber-400" />
+              <span className="text-sm font-semibold text-white">AI Risk Monitor</span>
+              <span className="text-2xs bg-teal-500/10 border border-teal-500/20 text-teal-400 px-1.5 py-0.5 rounded-full">Live</span>
+            </div>
+            <button onClick={runAnalysis} className="text-2xs text-slate-500 hover:text-slate-300 transition-colors">
+              <Icon name="RefreshCw" size={11} className="inline mr-1" />Refresh
+            </button>
+          </div>
+          <div className="p-3 space-y-2 max-h-80 overflow-y-auto">
+            {riskAssessments.length === 0 ? (
+              <div className="py-6 text-center">
+                <Icon name="ShieldCheck" size={24} className="text-teal-400/40 mx-auto mb-2" />
+                <p className="text-xs text-slate-500">No risk signals detected across all patients.</p>
+              </div>
+            ) : (
+              riskAssessments.filter(r => r.level !== RISK_LEVELS.CRITICAL).map(a => (
+                <RiskAlertCard key={a.patientId} assessment={a}
+                  onView={id => navigate(`/patients/${id}`)}
+                  onDismiss={dismissRisk} />
+              ))
+            )}
+          </div>
         </div>
 
-        {/* Main Grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          {/* Patient Cards */}
-          <div className="lg:col-span-1 bg-slate-800/20 border border-slate-800/60 rounded-xl overflow-hidden">
-            <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800/40">
-              <span className="text-sm font-semibold text-white">Patient Overview</span>
-              <button onClick={() => navigate('/patients')} className="text-xs text-teal-400 hover:text-teal-300 transition-colors">View all</button>
-            </div>
-            <div className="p-3 space-y-2">
-              {patients.length === 0 ? (
-                <div className="py-6 text-center text-slate-600 text-xs">No patients yet</div>
-              ) : patients.slice(0, 5).map(p => (
-                <PatientCard key={p.id} patient={p} onClick={() => navigate(`/patients/${p.id}`)} />
-              ))}
-            </div>
-          </div>
+        {/* Right column: Active sessions + Recent check-ins */}
+        <div className="space-y-4">
 
-          {/* Session Timeline */}
-          <div className="lg:col-span-1 bg-slate-800/20 border border-slate-800/60 rounded-xl overflow-hidden">
-            <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800/40">
-              <span className="text-sm font-semibold text-white">Session Timeline</span>
-              <button onClick={() => navigate('/sessions')} className="text-xs text-teal-400 hover:text-teal-300 transition-colors">View all</button>
-            </div>
-            <div className="p-3 space-y-1 max-h-80 overflow-y-auto scrollbar-none">
-              {sessions.length === 0 ? (
-                <div className="py-6 text-center text-slate-600 text-xs">No sessions recorded</div>
-              ) : sessions.slice(0, 8).map(s => (
-                <SessionTimelineRow key={s.id} session={s} />
-              ))}
-            </div>
-          </div>
-
-          {/* AI Insights + Event Feed */}
-          <div className="lg:col-span-1 space-y-4">
-            <AIInsightPanel sessions={sessions} patients={patients} />
+          {/* Active sessions */}
+          {activeSessions.length > 0 && (
             <div className="bg-slate-800/20 border border-slate-800/60 rounded-xl overflow-hidden">
-              <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800/40">
-                <span className="text-sm font-semibold text-white">Session Event Stream</span>
-                <span className="text-2xs text-slate-600 font-mono">{events.length} events</span>
+              <div className="px-4 py-3 border-b border-slate-800/40 flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-teal-400 animate-pulse" />
+                <span className="text-sm font-semibold text-white">Active Sessions</span>
               </div>
-              <div className="p-3 max-h-48 overflow-y-auto scrollbar-none">
-                <EventFeed events={events} />
+              <div className="p-2 space-y-1">
+                {activeSessions.map(s => <ActiveSessionRow key={s.id} session={s} />)}
               </div>
+            </div>
+          )}
+
+          {/* Recent check-ins */}
+          <div className="bg-slate-800/20 border border-slate-800/60 rounded-xl overflow-hidden">
+            <div className="px-4 py-3 border-b border-slate-800/40 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Icon name="Heart" size={14} className="text-violet-400" />
+                <span className="text-sm font-semibold text-white">Recent Check-ins</span>
+              </div>
+              <button onClick={() => navigate('/wellbeing')} className="text-2xs text-slate-500 hover:text-slate-300">See all</button>
+            </div>
+            <div className="divide-y divide-slate-800/40">
+              {liveCheckins.length === 0 ? (
+                <div className="py-6 text-center">
+                  <Icon name="Inbox" size={20} className="text-slate-600 mx-auto mb-2" />
+                  <p className="text-xs text-slate-500">No check-ins yet. They appear here in real-time.</p>
+                </div>
+              ) : (
+                liveCheckins.slice(0, 6).map(c => <CheckinRow key={c.id} checkin={c} />)
+              )}
             </div>
           </div>
         </div>
       </div>
+
+      {/* Patient summary with risk levels */}
+      <div className="bg-slate-800/20 border border-slate-800/60 rounded-xl overflow-hidden">
+        <div className="px-4 py-3 border-b border-slate-800/40 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Icon name="Users" size={14} className="text-teal-400" />
+            <span className="text-sm font-semibold text-white">Patient Overview</span>
+          </div>
+          <button onClick={() => navigate('/patients')} className="text-2xs text-slate-500 hover:text-slate-300">View all</button>
+        </div>
+        <div className="divide-y divide-slate-800/30">
+          {patients.slice(0, 8).map(p => {
+            const assessment = riskAssessments.find(r => r.patientId === p.id)
+            const stCfg = PATIENT_STATE_CONFIG[p.state] || PATIENT_STATE_CONFIG.neutral
+            return (
+              <div key={p.id}
+                onClick={() => navigate(`/patients/${p.id}`)}
+                className="flex items-center gap-3 px-4 py-3 hover:bg-slate-800/40 cursor-pointer transition-colors"
+              >
+                <div className="w-8 h-8 rounded-full bg-teal-500/10 border border-teal-500/20 flex items-center justify-center flex-shrink-0">
+                  <span className="text-xs font-bold text-teal-400">{p.initials}</span>
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm font-medium text-white">{p.name}</div>
+                  <div className="text-2xs text-slate-500">{p.sessions} sessions · Last: {p.lastSession}</div>
+                </div>
+                <div className="flex items-center gap-2">
+                  {assessment ? (
+                    <RiskBadge level={assessment.level} />
+                  ) : (
+                    <span className={`text-2xs px-2 py-0.5 rounded-full border ${stCfg.bg} ${stCfg.border} ${stCfg.color}`}>
+                      {stCfg.label}
+                    </span>
+                  )}
+                  <Icon name="ChevronRight" size={12} className="text-slate-600" />
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+
+      {/* Disclaimer */}
+      <p className="text-2xs text-slate-700 text-center leading-relaxed pb-2">
+        AI risk signals are for clinical decision support only. All outputs require professional review.
+        Not a substitute for clinical judgement.
+      </p>
     </div>
   )
 }
